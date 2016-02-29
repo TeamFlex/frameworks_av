@@ -925,7 +925,7 @@ status_t ACodec::setupNativeWindowSizeFormatAndUsage(
 #endif
 
     ALOGV("gralloc usage: %#x(OMX) => %#x(ACodec)", omxUsage, usage);
-    return setNativeWindowSizeFormatAndUsage(
+    err = setNativeWindowSizeFormatAndUsage(
             nativeWindow,
             def.format.video.nFrameWidth,
             def.format.video.nFrameHeight,
@@ -936,6 +936,26 @@ status_t ACodec::setupNativeWindowSizeFormatAndUsage(
 #endif
             mRotationDegrees,
             usage);
+#ifdef QCOM_HARDWARE
+    if (err == OK) {
+        OMX_CONFIG_RECTTYPE rect;
+        InitOMXParams(&rect);
+        rect.nPortIndex = kPortIndexOutput;
+        err = mOMX->getConfig(
+                mNode, OMX_IndexConfigCommonOutputCrop, &rect, sizeof(rect));
+        if (err == OK) {
+            ALOGV("rect size = %d, %d, %d, %d", rect.nLeft, rect.nTop, rect.nWidth, rect.nHeight);
+            android_native_rect_t crop;
+            crop.left = rect.nLeft;
+            crop.top = rect.nTop;
+            crop.right = rect.nLeft + rect.nWidth - 1;
+            crop.bottom = rect.nTop + rect.nHeight - 1;
+            ALOGV("crop update (%d, %d), (%d, %d)", crop.left, crop.top, crop.right, crop.bottom);
+            err = native_window_set_crop(nativeWindow, &crop);
+        }
+    }
+#endif
+    return err;
 }
 
 status_t ACodec::configureOutputBuffersFromNativeWindow(
@@ -6654,8 +6674,34 @@ bool ACodec::OutputPortSettingsChangedState::onMessageReceived(
     bool handled = false;
 
     switch (msg->what()) {
-        case kWhatFlush:
         case kWhatShutdown:
+        {
+            int32_t keepComponentAllocated;
+            CHECK(msg->findInt32(
+                        "keepComponentAllocated", &keepComponentAllocated));
+
+            mCodec->mShutdownInProgress = true;
+            mCodec->mExplicitShutdown = true;
+            mCodec->mKeepComponentAllocated = keepComponentAllocated;
+
+            status_t err = mCodec->mOMX->sendCommand(
+                    mCodec->mNode, OMX_CommandStateSet, OMX_StateIdle);
+            if (err != OK) {
+                if (keepComponentAllocated) {
+                    mCodec->signalError(OMX_ErrorUndefined, FAILED_TRANSACTION);
+                }
+                // TODO: do some recovery here.
+            } else {
+                // This is technically not correct, but appears to be
+                // the only way to free the component instance using
+                // ExectingToIdleState.
+                mCodec->changeState(mCodec->mExecutingToIdleState);
+            }
+
+            handled = true;
+            break;
+        }
+        case kWhatFlush:
         case kWhatResume:
         case kWhatSetParameters:
         {
@@ -6722,15 +6768,6 @@ bool ACodec::OutputPortSettingsChangedState::onOMXEvent(
 
                 if (err != OK) {
                     mCodec->signalError(OMX_ErrorUndefined, makeNoSideEffectStatus(err));
-
-                    // This is technically not correct, but appears to be
-                    // the only way to free the component instance.
-                    // Controlled transitioning from excecuting->idle
-                    // and idle->loaded seem impossible probably because
-                    // the output port never finishes re-enabling.
-                    mCodec->mShutdownInProgress = true;
-                    mCodec->mKeepComponentAllocated = false;
-                    mCodec->changeState(mCodec->mLoadedState);
                 }
 
                 return true;
